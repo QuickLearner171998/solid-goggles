@@ -338,7 +338,8 @@ class WeddingAlbumSelector:
                 cluster_groups,
                 self.loader,
                 self.processor,
-                top_k_per_cluster=None  # No hard limit - let LLM decide
+                top_k_per_cluster=None,  # No hard limit - let LLM decide
+                output_dir=self.logger.intermediate_dir if self.logger else None  # Real-time saving
             )
             
             # Save LLM selections

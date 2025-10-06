@@ -53,11 +53,13 @@ class ImageEmbedder:
             self._init_clip('clip-ViT-B-32')
     
     def _init_clip(self, model_name: str):
-        """Initialize CLIP model."""
-        self.model = SentenceTransformer(model_name, device=self.device, use_fast=True)
+        """Initialize CLIP model for IMAGE embeddings."""
+        # Note: SentenceTransformer with CLIP processes images via the vision encoder
+        # use_fast is for text tokenizers only, not applicable to image embeddings
+        self.model = SentenceTransformer(model_name, device=self.device)
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
         self.model_type = 'clip'
-        print(f"✓ CLIP model loaded. Embedding dimension: {self.embedding_dim}")
+        print(f"✓ CLIP model loaded for IMAGE embeddings. Dimension: {self.embedding_dim}")
     
     def _init_dinov2(self, model_name: str):
         """Initialize DINOv2 model."""

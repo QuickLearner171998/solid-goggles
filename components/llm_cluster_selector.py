@@ -114,6 +114,10 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
         self.client = OpenAI(api_key=self.api_key)
         self.rate_limit_lock = threading.Lock()
         self.rate_limit_delay = 0  # Dynamic delay based on rate limits
+        
+        # For real-time saving
+        self.output_dir = None
+        self.save_lock = threading.Lock()  # Thread-safe file operations
     
     @staticmethod
     def _encode_image_base64(image_bytes: bytes) -> str:
@@ -289,6 +293,10 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
                             selected['original_metadata'] = img
                             break
                 
+                # Save LLM result immediately (real-time)
+                if self.output_dir:
+                    self._save_llm_result_realtime(result, valid_images)
+                
                 return result
                 
             except Exception as e:
@@ -316,14 +324,14 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
                         'selected_images': [
                             {
                                 'filename': img['name'],
-                                'rank': i + 1,
-                                'reason': 'Fallback: top local score',
+                                'rank': i+1,
+                                'reason': 'Fallback: selected by local score',
                                 'technical_score': 0,
                                 'composition_score': 0,
                                 'moment_score': 0,
                                 'original_metadata': img
                             }
-                            for i, img in enumerate(sorted_imgs[:top_k])
+                            for i, img in enumerate(sorted_imgs[:top_k] if top_k else sorted_imgs[:5])
                         ],
                         'cluster_summary': 'LLM selection failed, using local scores'
                     }
@@ -419,18 +427,25 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
         
         print(f"      ✓ Selected {len(all_selected)} images from {len(cluster_images)} total (multi-pass)")
         
-        return {
+        result = {
             'selected_images': all_selected,
             'cluster_summary': combined_summary,
             'cluster_importance': overall_importance
         }
+        
+        # Save selected images from this cluster (real-time)
+        if self.output_dir and all_selected:
+            self._save_selected_images_realtime(all_selected, cluster_images[0].get('cluster_id', 'unknown'))
+        
+        return result
     
     def select_from_all_clusters(self,
                                 cluster_groups: Dict[int, List[Dict]],
                                 image_loader,
                                 image_processor,
                                 top_k_per_cluster: int = None,
-                                use_parallel: bool = True) -> Dict[int, Dict]:
+                                use_parallel: bool = True,
+                                output_dir: str = None) -> Dict[int, Dict]:
         """Select best images from all clusters using PARALLEL LLM calls with rate limit handling.
         
         Benefits of parallelism:
@@ -445,6 +460,7 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
             image_processor: ImageProcessor instance
             top_k_per_cluster: Soft suggestion (None = let LLM decide based on quality)
             use_parallel: Use parallel processing (default: True)
+            output_dir: Directory for real-time saving of results and images
             
         Returns:
             Dict mapping cluster_id -> selection results
@@ -454,14 +470,19 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
         print("  Rate limit handling: Enabled with exponential backoff")
         print("  No hard limits - prioritizing quality over arbitrary quotas")
         
+        # Setup real-time saving
+        if output_dir:
+            self.output_dir = output_dir
+            os.makedirs(os.path.join(output_dir, 'llm_selections'), exist_ok=True)
+            os.makedirs(os.path.join(output_dir, 'selected_images'), exist_ok=True)
+            print(f"  Real-time saving: Enabled → {output_dir}")
+        
         if not use_parallel or len(cluster_groups) <= 1:
             # Sequential processing for small workloads
             return self._select_sequential(cluster_groups, image_loader, image_processor, top_k_per_cluster)
         else:
             # Parallel processing with rate limit handling
             return self._select_parallel(cluster_groups, image_loader, image_processor, top_k_per_cluster)
-        
-        return selections
     
     def _select_sequential(self, cluster_groups: Dict[int, List[Dict]],
                           image_loader, image_processor,
@@ -541,11 +562,79 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
         print(f"  Total images selected: {total_selected} out of {total_available} ({100*total_selected/max(1,total_available):.1f}%)")
         print(f"  High-importance clusters: {high_importance}")
         print(f"  Avg images per cluster: {total_selected // max(1, len(selections))}")
+        
+        if self.output_dir:
+            print(f"  Real-time saves: {self.output_dir}/llm_selections/ and /selected_images/")
+    
+    def _save_llm_result_realtime(self, result: Dict, valid_images: List[Dict]):
+        """Save LLM result immediately after processing (real-time).
+        
+        Args:
+            result: LLM selection result
+            valid_images: Original image metadata
+        """
+        if not self.output_dir:
+            return
+        
+        try:
+            with self.save_lock:
+                # Create unique filename based on first image in batch
+                first_img = valid_images[0]['name'] if valid_images else 'unknown'
+                timestamp = time.time()
+                filename = f"llm_result_{timestamp}_{first_img[:20]}.json"
+                filepath = os.path.join(self.output_dir, 'llm_selections', filename)
+                
+                # Save result
+                with open(filepath, 'w') as f:
+                    json.dump({
+                        'timestamp': timestamp,
+                        'num_images_evaluated': len(valid_images),
+                        'num_selected': len(result.get('selected_images', [])),
+                        'cluster_summary': result.get('cluster_summary', ''),
+                        'cluster_importance': result.get('cluster_importance', ''),
+                        'selected_images': result.get('selected_images', []),
+                        'evaluated_images': [img['name'] for img in valid_images]
+                    }, f, indent=2)
+                    
+        except Exception as e:
+            print(f"  ⚠ Error saving LLM result: {e}")
+    
+    def _save_selected_images_realtime(self, selected_images: List[Dict], cluster_id: int):
+        """Copy selected images to output directory immediately (real-time).
+        
+        Args:
+            selected_images: List of selected image dicts
+            cluster_id: Cluster identifier
+        """
+        if not self.output_dir:
+            return
+        
+        try:
+            with self.save_lock:
+                # Create cluster subdirectory
+                cluster_dir = os.path.join(self.output_dir, 'selected_images', f'cluster_{cluster_id:03d}')
+                os.makedirs(cluster_dir, exist_ok=True)
+                
+                # Copy images
+                for img_data in selected_images:
+                    if 'original_metadata' in img_data:
+                        metadata = img_data['original_metadata']
+                        src_path = metadata.get('path')
+                        
+                        if src_path and os.path.exists(src_path):
+                            rank = img_data.get('rank', 0)
+                            filename = f"rank{rank:02d}_{metadata['name']}"
+                            dest_path = os.path.join(cluster_dir, filename)
+                            
+                            shutil.copy2(src_path, dest_path)
+                            
+        except Exception as e:
+            print(f"  ⚠ Error saving selected images: {e}")
     
     def save_selections(self, 
                        selections: Dict[int, Dict],
                        output_dir: str):
-        """Save cluster selections to disk.
+        """Save cluster selections to disk (final summary).
         
         Args:
             selections: Selection results from select_from_all_clusters
@@ -560,17 +649,17 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
         serializable_selections = {}
         for cluster_id, result in selections.items():
             serializable_selections[str(cluster_id)] = {
-                'cluster_summary': result['cluster_summary'],
-                'selected_count': len(result['selected_images']),
+                'cluster_summary': result.get('cluster_summary', ''),
+                'cluster_importance': result.get('cluster_importance', ''),
+                'num_selected': len(result.get('selected_images', [])),
                 'selected_images': [
                     {
-                        'filename': img['filename'],
-                        'rank': img['rank'],
-                        'reason': img['reason'],
-                        'technical_score': img['technical_score'],
-                        'composition_score': img['composition_score'],
-                        'moment_score': img['moment_score'],
-                        'path': img['original_metadata']['path']
+                        'filename': img.get('filename', ''),
+                        'rank': img.get('rank', 0),
+                        'reason': img.get('reason', ''),
+                        'technical_score': img.get('technical_score', 0),
+                        'composition_score': img.get('composition_score', 0),
+                        'moment_score': img.get('moment_score', 0)
                     }
                     for img in result['selected_images']
                 ]
@@ -593,19 +682,24 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
                 'reason', 'cluster_summary'
             ])
             
+            csv_rows = []
             for cluster_id, result in selections.items():
-                for img in result['selected_images']:
-                    writer.writerow([
+                for img in result.get('selected_images', []):
+                    metadata = img.get('original_metadata', {})
+                    csv_rows.append([
                         cluster_id,
-                        img['rank'],
-                        img['filename'],
-                        img['original_metadata']['path'],
-                        img['technical_score'],
-                        img['composition_score'],
-                        img['moment_score'],
-                        img['reason'],
-                        result['cluster_summary']
+                        img.get('rank', ''),
+                        img.get('filename', ''),
+                        metadata.get('path', ''),
+                        img.get('technical_score', ''),
+                        img.get('composition_score', ''),
+                        img.get('moment_score', ''),
+                        img.get('reason', ''),
+                        result.get('cluster_summary', '')
                     ])
+            
+            writer.writerows(csv_rows)
         
-        print(f"✓ Saved LLM cluster selections CSV: {csv_path}")
-
+        print(f"\n✓ Saved {len(csv_rows)} LLM selections to:")
+        print(f"  JSON: {json_path}")
+        print(f"  CSV:  {csv_path}")

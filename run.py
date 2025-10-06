@@ -16,32 +16,23 @@ from wedding_album_selector import WeddingAlbumSelector
 def main():
     """Main entry point."""
     try:
-        # Validate configuration
-        Config.validate()
-        
-        # Create and run selector
-        selector = WeddingAlbumSelector()
-        selector.run()
-        
-    except ValueError as e:
-        print(f"\n❌ Configuration Error: {e}")
-        
-        # Prompt for API key if missing
-        if "OPENAI_API_KEY" in str(e):
+        # Check API key
+        if not Config.OPENAI_API_KEY:
+            print("\n❌ Configuration Error: OPENAI_API_KEY not found in environment")
             try:
                 api_key = input("\nEnter your OpenAI API key: ").strip()
                 if api_key:
                     Config.OPENAI_API_KEY = api_key
-                    selector = WeddingAlbumSelector()
-                    selector.run()
                 else:
                     print("No API key provided. Exiting.")
                     sys.exit(1)
             except KeyboardInterrupt:
                 print("\nCancelled.")
                 sys.exit(1)
-        else:
-            sys.exit(1)
+        
+        # Create and run selector
+        selector = WeddingAlbumSelector()
+        selector.run()
             
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.")

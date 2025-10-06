@@ -17,7 +17,9 @@ class LLMClusterSelector:
     
     CLUSTER_SELECTION_PROMPT = """You are an expert wedding photographer with 20+ years of experience selecting images for award-winning albums.
 
-You are reviewing a CLUSTER of similar wedding photos (similar moment/scene/composition). Your task is to select ONLY the BEST images from this cluster, following professional album curation principles.
+You are reviewing a CLUSTER of similar wedding photos (similar moment/scene/composition). Your task is to select THE BEST images from this cluster that deserve to be in the final album, following professional album curation principles.
+
+**CRITICAL: NO HARD LIMITS** - Select as many or as few images as truly deserve to be in the album. Some clusters may have 15 great shots, others may have only 2-3 worthy images.
 
 **PROFESSIONAL SELECTION CRITERIA:**
 
@@ -49,24 +51,29 @@ You are reviewing a CLUSTER of similar wedding photos (similar moment/scene/comp
    - ✗ Soft focus or blur on faces
    - ✗ Closed eyes during important moments
    - ✗ Awkward expressions (mid-blink, talking, grimacing)
-   - ✗ Poor lighting (too dark/bright)
+   - ✗ Poor lighting (too dark/bright, washed out)
    - ✗ Distracting backgrounds
+   - ✗ Technically flawed (wrong focus, motion blur)
 
 2. **Compare Remaining**:
    - Which has SHARPEST focus?
    - Which has BEST expression?
    - Which has STRONGEST composition?
    - Which tells the BEST story?
+   - Which captures peak emotion/moment?
 
-3. **Avoid Redundancy**:
-   - Don't select near-duplicate poses/compositions
-   - Choose ONE best from similar shots
-   - Prefer diverse moments within cluster
+3. **Smart Redundancy Management**:
+   - If multiple shots show DIFFERENT emotions/angles of the SAME moment: KEEP multiple shots
+   - If shots are true duplicates (same pose/expression): Choose ONLY the best one
+   - Prefer diverse moments and angles within cluster
+   - **KEY**: If a cluster captures an important ceremony moment (e.g., vows, ring exchange), keep MORE images to tell the complete story
 
-4. **Quality Over Quantity**:
-   - Better to select 3 excellent images than 10 mediocre ones
+4. **Quality AND Quantity Balance**:
+   - **IMPORTANT CLUSTERS** (ceremony moments, emotional peaks): Select 10-20 images if they're all album-worthy
+   - **STANDARD CLUSTERS** (portraits, group shots): Select 3-8 of the best
+   - **WEAK CLUSTERS** (less important, repetitive): Select 1-3 only if excellent
    - Every selected image must be album-worthy
-   - When in doubt, leave it out
+   - **DON'T lose good images** - better to include an extra good shot than exclude it
 
 **RESPONSE FORMAT (STRICT JSON):**
 Return a JSON object:
@@ -74,17 +81,18 @@ Return a JSON object:
   "selected_images": [
     {
       "filename": "exact_filename",
-      "rank": 1-10,
+      "rank": 1-N,
       "reason": "brief reason for selection",
       "technical_score": 0-100,
       "composition_score": 0-100,
       "moment_score": 0-100
     }
   ],
-  "cluster_summary": "brief description of what this cluster contains"
+  "cluster_summary": "brief description of what this cluster contains",
+  "cluster_importance": "low/medium/high - how critical is this cluster for album storytelling"
 }
 
-Order by rank (1 = best). Include up to 10 images maximum."""
+Order by rank (1 = best). Select AS MANY images as truly deserve to be in the album - NO artificial limits!"""
     
     def __init__(self, api_key: str = None, model: str = None):
         """Initialize LLM cluster selector.
@@ -138,14 +146,14 @@ Order by rank (1 = best). Include up to 10 images maximum."""
                            cluster_images: List[Dict],
                            image_loader,
                            image_processor,
-                           top_k: int = 10) -> Dict:
-        """Select best images from a cluster using LLM.
+                           top_k: int = None) -> Dict:
+        """Select best images from a cluster using LLM (NO HARD LIMITS).
         
         Args:
             cluster_images: List of image metadata dicts from this cluster
             image_loader: ImageLoader instance
             image_processor: ImageProcessor instance
-            top_k: Number of images to select
+            top_k: Soft suggestion (None = let LLM decide based on quality)
             
         Returns:
             Dict with selection results and cluster summary
@@ -153,18 +161,20 @@ Order by rank (1 = best). Include up to 10 images maximum."""
         if not cluster_images:
             return {
                 'selected_images': [],
-                'cluster_summary': 'Empty cluster'
+                'cluster_summary': 'Empty cluster',
+                'cluster_importance': 'none'
             }
         
-        # Limit to reasonable batch size for LLM
-        max_batch = min(len(cluster_images), 20)
+        # Process ALL images from cluster (or up to 25 for very large clusters)
+        max_batch = min(len(cluster_images), 25)
         batch_images = cluster_images[:max_batch]
         
         # Prepare images for LLM
         llm_content = []
+        selection_instruction = f"You have {len(batch_images)} images from this cluster. Select AS MANY as truly deserve to be in the album (could be 2, could be 15, could be all of them). Quality over arbitrary limits!"
         llm_content.append({
             "type": "text",
-            "text": f"Select the best {top_k} images from this cluster of {len(batch_images)} similar wedding photos."
+            "text": selection_instruction
         })
         
         valid_images = []
@@ -272,14 +282,14 @@ Order by rank (1 = best). Include up to 10 images maximum."""
                                 cluster_groups: Dict[int, List[Dict]],
                                 image_loader,
                                 image_processor,
-                                top_k_per_cluster: int = 10) -> Dict[int, Dict]:
-        """Select best images from all clusters using LLM.
+                                top_k_per_cluster: int = None) -> Dict[int, Dict]:
+        """Select best images from all clusters using LLM (SMART, NO HARD LIMITS).
         
         Args:
             cluster_groups: Dict mapping cluster_id -> list of images
             image_loader: ImageLoader instance
             image_processor: ImageProcessor instance
-            top_k_per_cluster: Images to select per cluster
+            top_k_per_cluster: Soft suggestion (None = let LLM decide based on quality)
             
         Returns:
             Dict mapping cluster_id -> selection results
@@ -287,11 +297,13 @@ Order by rank (1 = best). Include up to 10 images maximum."""
         from tqdm import tqdm
         
         print(f"\n[LLM Cluster Selection] Processing {len(cluster_groups)} clusters...")
+        print("  Strategy: LLM will intelligently select best images from each cluster")
+        print("  No hard limits - prioritizing quality over arbitrary quotas")
         
         selections = {}
         
         for cluster_id, images in tqdm(cluster_groups.items(), 
-                                       desc="LLM selecting from clusters",
+                                       desc="LLM smart selection",
                                        ncols=80):
             if cluster_id == -1:  # Skip noise cluster
                 continue
@@ -305,11 +317,16 @@ Order by rank (1 = best). Include up to 10 images maximum."""
             
             selections[cluster_id] = selection
         
-        # Print summary
+        # Print detailed summary
         total_selected = sum(len(s['selected_images']) for s in selections.values())
-        print(f"\n✓ LLM cluster selection complete:")
+        total_available = sum(len(images) for cid, images in cluster_groups.items() if cid != -1)
+        high_importance = sum(1 for s in selections.values() if s.get('cluster_importance') == 'high')
+        
+        print(f"\n✓ LLM smart cluster selection complete:")
         print(f"  Clusters processed: {len(selections)}")
-        print(f"  Total images selected: {total_selected}")
+        print(f"  Total images selected: {total_selected} out of {total_available} ({100*total_selected/max(1,total_available):.1f}%)")
+        print(f"  High-importance clusters: {high_importance}")
+        print(f"  Avg images per cluster: {total_selected // max(1, len(selections))}")
         
         return selections
     

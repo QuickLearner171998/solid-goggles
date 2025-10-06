@@ -314,17 +314,20 @@ class WeddingAlbumSelector:
             clustering_path = f"{self.logger.intermediate_dir}/03_clustering_results.json"
             self.clusterer.save_clustering_results(clustering_path, embeddings, candidates)
         
+        # Save cluster visualization (copy ALL images to cluster directories)
+        if self.config.SAVE_CLUSTER_IMAGES and self.logger:
+            self.clusterer.save_cluster_visualization(
+                self.logger.intermediate_dir, 
+                candidates,
+                save_all=True
+            )
+        
         # Group images by cluster
         from collections import defaultdict
         cluster_groups = defaultdict(list)
         for candidate in candidates:
             cluster_id = candidate.get('cluster_id', -1)
             cluster_groups[cluster_id].append(candidate)
-        
-        # Save sample images from each cluster for debugging
-        if self.config.SAVE_CLUSTER_IMAGES and self.logger:
-            print("\nSaving sample images from each cluster...")
-            self._save_cluster_samples(cluster_groups)
         
         # Use LLM to select best from each cluster (heavy LLM processing)
         if self.config.USE_LLM_FOR_CLUSTER_SELECTION and self.llm_cluster_selector:
@@ -334,7 +337,7 @@ class WeddingAlbumSelector:
                 cluster_groups,
                 self.loader,
                 self.processor,
-                top_k_per_cluster=self.config.IMAGES_PER_CLUSTER
+                top_k_per_cluster=None  # No hard limit - let LLM decide
             )
             
             # Save LLM selections

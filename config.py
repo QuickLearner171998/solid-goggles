@@ -53,19 +53,27 @@ class Config:
     MAX_EXPOSURE = 0.85
     
     # Embedding & Clustering
-    USE_EMBEDDINGS = True  # Use CLIP embeddings for clustering
-    EMBEDDING_MODEL = "clip-ViT-B-32"  # CLIP model for embeddings
-    EMBEDDING_BATCH_SIZE = 32  # Batch size for embedding generation
+    USE_EMBEDDINGS = True  # Generate embeddings for clustering
+    
+    # Embedding Model Selection (DINOv2 recommended for wedding photos)
+    # Options:
+    #   'dinov2-small': 384D, fastest (good for >5000 images)
+    #   'dinov2-base': 768D, balanced - RECOMMENDED for wedding albums
+    #   'dinov2-large': 1024D, highest quality (slower)
+    #   'clip-ViT-B-32': 512D, CLIP (good for semantic + text understanding)
+    EMBEDDING_MODEL = "clip-ViT-B-32"  # DINOv2 base - best balance of speed & quality
+    
+    EMBEDDING_BATCH_SIZE = 32  # Batch size (lower for DINOv2, it's more memory intensive)
     REDUCE_DIMENSIONS = True  # Use UMAP for dimensionality reduction
     DIMENSION_TARGET = 50  # Target dimensions after reduction
     
-    # Clustering parameters
-    CLUSTERING_METHOD = "kmeans"  # 'kmeans', 'dbscan', or 'auto'
-    NUM_CLUSTERS = None  # Auto-determine if None
-    MIN_CLUSTERS = 20  # Minimum clusters
-    MAX_CLUSTERS = 100  # Maximum clusters
-    IMAGES_PER_CLUSTER = 10  # Best images to select from each cluster
-    USE_LLM_FOR_CLUSTER_SELECTION = True  # Use LLM to select best from each cluster
+    # Clustering parameters (state-of-the-art configuration)
+    # Based on research: CLIP + UMAP + K-Means with multiple quality metrics is highly effective
+    CLUSTERING_METHOD = "auto"  # 'kmeans', 'minibatch', or 'auto' (recommended)
+    NUM_CLUSTERS = None  # Auto-determine if None (optimal based on quality metrics)
+    MIN_CLUSTERS = 50  # Minimum clusters for auto mode (finer granularity)
+    MAX_CLUSTERS = 200  # Maximum clusters for auto mode (allows better grouping)
+    USE_LLM_FOR_CLUSTER_SELECTION = True  # Use LLM to select best from each cluster (smart, no hard limits)
     
     # Verbose logging & debugging
     VERBOSE_LOGGING = True  # Save intermediate results

@@ -1,4 +1,9 @@
-"""Image embedding component using CLIP for feature extraction."""
+"""Image embedding component supporting CLIP and DINOv2.
+
+Supported models:
+- CLIP: Excellent for semantic understanding (vision + text)
+- DINOv2: Meta's self-supervised model, excellent for pure visual features
+"""
 
 import os
 import torch
@@ -10,13 +15,17 @@ from tqdm import tqdm
 
 
 class ImageEmbedder:
-    """Generates embeddings for images using CLIP model."""
+    """Generates embeddings for images using CLIP or DINOv2."""
     
-    def __init__(self, model_name: str = 'clip-ViT-B-32', device: Optional[str] = None):
+    def __init__(self, model_name: str = 'dinov2-base', device: Optional[str] = None):
         """Initialize the image embedder.
         
         Args:
-            model_name: Name of the CLIP model to use
+            model_name: Model to use:
+                - 'clip-ViT-B-32': CLIP (vision + text, 512D)
+                - 'dinov2-small': DINOv2 small (384D, fast)
+                - 'dinov2-base': DINOv2 base (768D, balanced) [RECOMMENDED]
+                - 'dinov2-large': DINOv2 large (1024D, best quality)
             device: Device to run the model on ('cuda', 'mps', or 'cpu')
         """
         if device is None:
@@ -28,17 +37,67 @@ class ImageEmbedder:
                 device = 'cpu'
         
         self.device = device
-        print(f"Initializing ImageEmbedder with model '{model_name}' on device '{self.device}'")
+        self.model_name = model_name
+        self.model_type = 'dinov2' if 'dinov2' in model_name else 'clip'
+        
+        print(f"Initializing ImageEmbedder with {self.model_type.upper()} model '{model_name}' on device '{self.device}'")
         
         try:
-            self.model = SentenceTransformer(model_name, device=self.device)
-            self.embedding_dim = self.model.get_sentence_embedding_dimension()
-            print(f"✓ Model loaded successfully. Embedding dimension: {self.embedding_dim}")
+            if self.model_type == 'dinov2':
+                self._init_dinov2(model_name)
+            else:
+                self._init_clip(model_name)
         except Exception as e:
             print(f"⚠ Error loading model: {e}")
-            print("Falling back to basic CLIP model...")
-            self.model = SentenceTransformer('clip-ViT-B-32', device=self.device)
-            self.embedding_dim = self.model.get_sentence_embedding_dimension()
+            print("Falling back to CLIP ViT-B-32...")
+            self._init_clip('clip-ViT-B-32')
+    
+    def _init_clip(self, model_name: str):
+        """Initialize CLIP model."""
+        self.model = SentenceTransformer(model_name, device=self.device)
+        self.embedding_dim = self.model.get_sentence_embedding_dimension()
+        self.model_type = 'clip'
+        print(f"✓ CLIP model loaded. Embedding dimension: {self.embedding_dim}")
+    
+    def _init_dinov2(self, model_name: str):
+        """Initialize DINOv2 model."""
+        from transformers import AutoImageProcessor, AutoModel
+        import os
+        
+        # DINOv2 has MPS compatibility issues - use CPU fallback
+        if self.device == 'mps':
+            print("⚠ DINOv2 has MPS compatibility issues (upsample_bicubic2d operator)")
+            print("  Enabling CPU fallback for MPS (PYTORCH_ENABLE_MPS_FALLBACK=1)")
+            os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+            # Note: Model stays on MPS, but unsupported ops will fall back to CPU
+        
+        # Map short names to full Hugging Face model names
+        model_map = {
+            'dinov2-small': 'facebook/dinov2-small',
+            'dinov2-base': 'facebook/dinov2-base',
+            'dinov2-large': 'facebook/dinov2-large',
+            'dinov2-giant': 'facebook/dinov2-giant'
+        }
+        
+        full_model_name = model_map.get(model_name, model_name)
+        
+        print(f"Loading DINOv2 model: {full_model_name}")
+        # Use fast processor (future default behavior)
+        self.processor = AutoImageProcessor.from_pretrained(full_model_name, use_fast=True)
+        self.model = AutoModel.from_pretrained(full_model_name).to(self.device)
+        self.model.eval()
+        
+        # DINOv2 embedding dimensions
+        dim_map = {
+            'dinov2-small': 384,
+            'dinov2-base': 768,
+            'dinov2-large': 1024,
+            'dinov2-giant': 1536
+        }
+        self.embedding_dim = dim_map.get(model_name, 768)
+        
+        print(f"✓ DINOv2 model loaded. Embedding dimension: {self.embedding_dim}")
+        print(f"  Note: DINOv2 excels at pure visual features (self-supervised learning)")
     
     def generate_embedding(self, image: Image.Image) -> np.ndarray:
         """Generate embedding for a single image.
@@ -54,14 +113,34 @@ class ImageEmbedder:
             if image.mode != 'RGB':
                 image = image.convert('RGB')
             
-            # Generate embedding
-            embedding = self.model.encode(image, convert_to_numpy=True)
-            return embedding
+            if self.model_type == 'dinov2':
+                return self._generate_dinov2_embedding(image)
+            else:
+                return self._generate_clip_embedding(image)
             
         except Exception as e:
             print(f"Error generating embedding: {e}")
             # Return zero vector on error
             return np.zeros(self.embedding_dim, dtype=np.float32)
+    
+    def _generate_clip_embedding(self, image: Image.Image) -> np.ndarray:
+        """Generate CLIP embedding."""
+        embedding = self.model.encode(image, convert_to_numpy=True)
+        return embedding
+    
+    def _generate_dinov2_embedding(self, image: Image.Image) -> np.ndarray:
+        """Generate DINOv2 embedding."""
+        # Process image
+        inputs = self.processor(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # Generate embedding
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            # Extract CLS token embedding (first token)
+            embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()[0]
+        
+        return embedding
     
     def generate_embeddings_batch(self, images: List[Image.Image], 
                                   batch_size: int = 32,
@@ -76,11 +155,20 @@ class ImageEmbedder:
         Returns:
             Numpy array of shape (num_images, embedding_dim)
         """
+        if self.model_type == 'dinov2':
+            return self._generate_dinov2_embeddings_batch(images, batch_size, show_progress)
+        else:
+            return self._generate_clip_embeddings_batch(images, batch_size, show_progress)
+    
+    def _generate_clip_embeddings_batch(self, images: List[Image.Image], 
+                                        batch_size: int = 32,
+                                        show_progress: bool = True) -> np.ndarray:
+        """Generate CLIP embeddings for batch."""
         embeddings = []
         
         iterator = range(0, len(images), batch_size)
         if show_progress:
-            iterator = tqdm(iterator, desc="Generating embeddings", ncols=80)
+            iterator = tqdm(iterator, desc="CLIP embeddings", ncols=80)
         
         for i in iterator:
             batch = images[i:i + batch_size]
@@ -98,6 +186,45 @@ class ImageEmbedder:
                                                     convert_to_numpy=True,
                                                     batch_size=len(batch_rgb))
                 embeddings.append(batch_embeddings)
+            except Exception as e:
+                print(f"\n⚠ Error processing batch at index {i}: {e}")
+                # Add zero vectors for failed batch
+                embeddings.append(np.zeros((len(batch), self.embedding_dim), dtype=np.float32))
+        
+        return np.vstack(embeddings)
+    
+    def _generate_dinov2_embeddings_batch(self, images: List[Image.Image], 
+                                         batch_size: int = 16,
+                                         show_progress: bool = True) -> np.ndarray:
+        """Generate DINOv2 embeddings for batch."""
+        embeddings = []
+        
+        iterator = range(0, len(images), batch_size)
+        if show_progress:
+            iterator = tqdm(iterator, desc="DINOv2 embeddings", ncols=80)
+        
+        for i in iterator:
+            batch = images[i:i + batch_size]
+            
+            # Convert all images to RGB
+            batch_rgb = []
+            for img in batch:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                batch_rgb.append(img)
+            
+            try:
+                # Process batch with DINOv2
+                inputs = self.processor(images=batch_rgb, return_tensors="pt")
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    # Extract CLS token embeddings (first token from each image)
+                    batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+                
+                embeddings.append(batch_embeddings)
+                
             except Exception as e:
                 print(f"\n⚠ Error processing batch at index {i}: {e}")
                 # Add zero vectors for failed batch

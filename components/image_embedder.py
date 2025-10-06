@@ -54,7 +54,7 @@ class ImageEmbedder:
     
     def _init_clip(self, model_name: str):
         """Initialize CLIP model."""
-        self.model = SentenceTransformer(model_name, device=self.device)
+        self.model = SentenceTransformer(model_name, device=self.device, use_fast=True)
         self.embedding_dim = self.model.get_sentence_embedding_dimension()
         self.model_type = 'clip'
         print(f"✓ CLIP model loaded. Embedding dimension: {self.embedding_dim}")

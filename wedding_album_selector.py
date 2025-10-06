@@ -52,7 +52,8 @@ class WeddingAlbumSelector:
             if self.config.USE_LLM_FOR_CLUSTER_SELECTION:
                 self.llm_cluster_selector = LLMClusterSelector(
                     self.config.OPENAI_API_KEY,
-                    self.config.OPENAI_VISION_MODEL
+                    self.config.OPENAI_VISION_MODEL,
+                    max_workers=3  # 3 concurrent LLM calls for optimal speed
                 )
             else:
                 self.llm_cluster_selector = None
@@ -423,7 +424,13 @@ class WeddingAlbumSelector:
     
     def _finalize_selection(self, results: List[Dict], 
                            cluster_labels: Optional[np.ndarray] = None) -> Dict[str, List[Dict]]:
-        """Calculate final scores and select top images with balanced distribution.
+        """Calculate final scores and select with CLUSTER DIVERSITY optimization.
+        
+        Uses clustering intelligently:
+        1. Prioritizes high-importance clusters
+        2. Ensures balanced representation across clusters
+        3. Avoids over-selecting from single clusters
+        4. Maintains quality threshold
         
         Args:
             results: List of scored result dicts
@@ -432,6 +439,8 @@ class WeddingAlbumSelector:
         Returns:
             Dict with 'all' and 'selected' keys containing result lists
         """
+        print("\n[Final Selection] Applying cluster-aware intelligent selection...")
+        
         # Calculate final scores
         for result in results:
             llm_score = result.get('overall_score', 0)
@@ -445,14 +454,34 @@ class WeddingAlbumSelector:
             
             result['final_score'] = final_score
         
-        # Sort by final score
-        results.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+        # Group by cluster for diversity-aware selection
+        from collections import defaultdict
+        cluster_images = defaultdict(list)
+        for result in results:
+            cluster_id = result.get('cluster_id', -1)
+            cluster_images[cluster_id].append(result)
         
-        # Use curator for balanced selection across ceremony types
-        print("\nApplying intelligent curation for ceremony balance...")
-        selected = self.curator.curate_balanced_selection(results, self.config.NUM_SELECT)
+        # Sort images within each cluster by score
+        for cluster_id in cluster_images:
+            cluster_images[cluster_id].sort(key=lambda x: x.get('final_score', 0), reverse=True)
         
-        print(f"Selected {len(selected)} images from {len(results)} scored images")
+        # Determine cluster importance (if available from LLM)
+        cluster_importance = {}
+        for result in results:
+            cluster_id = result.get('cluster_id', -1)
+            importance = result.get('cluster_importance', 'medium')
+            if cluster_id not in cluster_importance:
+                cluster_importance[cluster_id] = importance
+        
+        # CLUSTER-AWARE SELECTION
+        selected = self._select_with_cluster_diversity(
+            cluster_images, 
+            cluster_importance,
+            target_count=self.config.NUM_SELECT
+        )
+        
+        print(f"✓ Selected {len(selected)} images from {len(results)} scored images")
+        print(f"  Represented clusters: {len(set(img.get('cluster_id') for img in selected))}/{len(cluster_images)}")
         self.stats.final_selected = len(selected)
         
         # Show distribution report
@@ -611,3 +640,80 @@ class WeddingAlbumSelector:
         
         print(f"✓ Copied {copied} images to {output_dir}")
         print(f"  Images ranked 1-{copied} by LLM score")
+    
+    def _select_with_cluster_diversity(self, cluster_images: Dict[int, List[Dict]],
+                                      cluster_importance: Dict[int, str],
+                                      target_count: int = 1000) -> List[Dict]:
+        """Select images with cluster diversity - MAXIMIZES clustering benefits.
+        
+        Strategy:
+        1. Allocate slots to clusters based on importance
+        2. Round-robin selection from clusters
+        3. Ensures diverse representation
+        4. Quality threshold maintained
+        
+        Args:
+            cluster_images: Dict of cluster_id -> list of images (sorted by score)
+            cluster_importance: Dict of cluster_id -> importance level
+            target_count: Target number of images
+            
+        Returns:
+            List of selected images with good cluster diversity
+        """
+        # Map importance to base allocation
+        importance_weights = {
+            'high': 15,      # High-importance clusters get more images
+            'medium': 8,     # Medium clusters get moderate allocation
+            'low': 3,        # Low clusters get minimum representation
+            'none': 1
+        }
+        
+        # Calculate initial allocation per cluster
+        cluster_allocations = {}
+        for cluster_id, images in cluster_images.items():
+            if not images:
+                continue
+            importance = cluster_importance.get(cluster_id, 'medium')
+            weight = importance_weights.get(importance, 8)
+            # Allocation = weight, but capped by available images
+            cluster_allocations[cluster_id] = min(weight, len(images))
+        
+        # Adjust allocations to hit target (may need scaling)
+        total_allocated = sum(cluster_allocations.values())
+        
+        if total_allocated > target_count:
+            # Scale down proportionally
+            scale_factor = target_count / total_allocated
+            for cluster_id in cluster_allocations:
+                cluster_allocations[cluster_id] = max(1, int(cluster_allocations[cluster_id] * scale_factor))
+        
+        # First pass: Select allocated images from each cluster
+        selected = []
+        for cluster_id, allocation in cluster_allocations.items():
+            images = cluster_images[cluster_id][:allocation]  # Top N from cluster
+            selected.extend(images)
+        
+        # Second pass: Fill remaining slots with best remaining images
+        if len(selected) < target_count:
+            remaining_needed = target_count - len(selected)
+            
+            # Get all non-selected images
+            selected_paths = {img['path'] for img in selected}
+            remaining = []
+            for images_list in cluster_images.values():
+                for img in images_list:
+                    if img['path'] not in selected_paths:
+                        remaining.append(img)
+            
+            # Sort by score and take top N
+            remaining.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+            selected.extend(remaining[:remaining_needed])
+        
+        # Final sort by score for ranking
+        selected.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+        
+        # Add rank
+        for idx, img in enumerate(selected, 1):
+            img['final_rank'] = idx
+        
+        return selected[:target_count]

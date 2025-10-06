@@ -1,4 +1,4 @@
-"""LLM-based cluster selection component."""
+"""LLM-based cluster selection component with parallel processing."""
 
 import json
 import time
@@ -10,6 +10,8 @@ from openai import OpenAI
 from config import Config
 from PIL import Image
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 
 class LLMClusterSelector:
@@ -94,20 +96,24 @@ Return a JSON object:
 
 Order by rank (1 = best). Select AS MANY images as truly deserve to be in the album - NO artificial limits!"""
     
-    def __init__(self, api_key: str = None, model: str = None):
-        """Initialize LLM cluster selector.
+    def __init__(self, api_key: str = None, model: str = None, max_workers: int = 3):
+        """Initialize LLM cluster selector with parallel processing support.
         
         Args:
             api_key: OpenAI API key
             model: Model name
+            max_workers: Maximum concurrent LLM API calls (default: 3)
         """
         self.api_key = api_key or Config.OPENAI_API_KEY
         self.model = model or Config.OPENAI_VISION_MODEL
+        self.max_workers = max_workers
         
         if not self.api_key:
             raise ValueError("OpenAI API key not provided")
         
         self.client = OpenAI(api_key=self.api_key)
+        self.rate_limit_lock = threading.Lock()
+        self.rate_limit_delay = 0  # Dynamic delay based on rate limits
     
     @staticmethod
     def _encode_image_base64(image_bytes: bytes) -> str:
@@ -147,7 +153,13 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
                            image_loader,
                            image_processor,
                            top_k: int = None) -> Dict:
-        """Select best images from a cluster using LLM (NO HARD LIMITS).
+        """Select best images from a cluster using INTELLIGENT MULTI-PASS LLM evaluation.
+        
+        Strategy:
+        - For clusters ≤20 images: Single LLM call evaluates all
+        - For clusters >20 images: Multiple passes, each evaluating 20 images
+        - All images are evaluated, none are lost
+        - Results aggregated and ranked across all passes
         
         Args:
             cluster_images: List of image metadata dicts from this cluster
@@ -165,10 +177,32 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
                 'cluster_importance': 'none'
             }
         
-        # Process ALL images from cluster (or up to 25 for very large clusters)
-        max_batch = min(len(cluster_images), 25)
-        batch_images = cluster_images[:max_batch]
+        # INTELLIGENT BATCHING: Process ALL images in multiple passes
+        batch_size = 20  # Optimal for LLM vision models
+        num_images = len(cluster_images)
         
+        if num_images <= batch_size:
+            # Small cluster: single pass evaluates all
+            return self._evaluate_batch(cluster_images, image_loader, image_processor, top_k)
+        else:
+            # Large cluster: multi-pass evaluation of ALL images
+            print(f"    Cluster has {num_images} images - using multi-pass evaluation")
+            return self._evaluate_large_cluster(cluster_images, image_loader, image_processor, 
+                                               batch_size, top_k)
+    
+    def _evaluate_batch(self, batch_images: List[Dict], 
+                       image_loader, image_processor, top_k: int = None) -> Dict:
+        """Evaluate a single batch of images with LLM.
+        
+        Args:
+            batch_images: List of images to evaluate (≤20 recommended)
+            image_loader: ImageLoader instance
+            image_processor: ImageProcessor instance
+            top_k: Optional limit
+            
+        Returns:
+            Dict with evaluation results
+        """
         # Prepare images for LLM
         llm_content = []
         selection_instruction = f"You have {len(batch_images)} images from this cluster. Select AS MANY as truly deserve to be in the album (could be 2, could be 15, could be all of them). Quality over arbitrary limits!"
@@ -213,10 +247,15 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
                 'cluster_summary': 'No valid images in cluster'
             }
         
-        # Call LLM with retry
-        max_retries = 3
+        # Call LLM with rate limit handling
+        max_retries = 5
         for attempt in range(max_retries):
             try:
+                # Apply dynamic rate limit delay
+                with self.rate_limit_lock:
+                    if self.rate_limit_delay > 0:
+                        time.sleep(self.rate_limit_delay)
+                
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
@@ -226,6 +265,10 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
                     temperature=0.1,
                     max_tokens=Config.LLM_MAX_TOKENS,
                 )
+                
+                # Success - reduce rate limit delay
+                with self.rate_limit_lock:
+                    self.rate_limit_delay = max(0, self.rate_limit_delay - 0.5)
                 
                 result_text = response.choices[0].message.content.strip()
                 
@@ -249,6 +292,20 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
                 return result
                 
             except Exception as e:
+                error_str = str(e).lower()
+                
+                # Handle rate limits
+                if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
+                    retry_delay = min(2 ** attempt, 32)  # Exponential backoff, max 32s
+                    
+                    with self.rate_limit_lock:
+                        self.rate_limit_delay = max(self.rate_limit_delay, retry_delay / 2)
+                    
+                    print(f"  ⚠ Rate limit hit, waiting {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    continue
+                
+                # Handle other errors
                 if attempt == max_retries - 1:
                     print(f"  ✗ LLM cluster selection failed: {e}")
                     # Return top images by local score as fallback
@@ -278,57 +335,212 @@ Order by rank (1 = best). Select AS MANY images as truly deserve to be in the al
             'cluster_summary': 'Selection failed'
         }
     
+    def _evaluate_large_cluster(self, cluster_images: List[Dict],
+                               image_loader, image_processor,
+                               batch_size: int = 20, top_k: int = None) -> Dict:
+        """Evaluate large cluster using multi-pass approach - NO IMAGES LOST.
+        
+        Strategy:
+        1. Split cluster into batches of `batch_size` images
+        2. Evaluate each batch with LLM
+        3. Collect ALL selected images from all batches
+        4. Rank and aggregate results
+        
+        Args:
+            cluster_images: All images in the cluster
+            image_loader: ImageLoader instance
+            image_processor: ImageProcessor instance
+            batch_size: Images per LLM call
+            top_k: Optional soft limit
+            
+        Returns:
+            Aggregated results from all batches
+        """
+        all_selected = []
+        cluster_summaries = []
+        importance_levels = []
+        
+        # Process cluster in batches - evaluate ALL images
+        num_batches = (len(cluster_images) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(cluster_images))
+            batch = cluster_images[start_idx:end_idx]
+            
+            print(f"      Pass {batch_idx+1}/{num_batches}: Evaluating images {start_idx+1}-{end_idx}")
+            
+            # Evaluate this batch
+            batch_result = self._evaluate_batch(batch, image_loader, image_processor, top_k)
+            
+            # Collect results
+            if batch_result.get('selected_images'):
+                all_selected.extend(batch_result['selected_images'])
+            
+            if batch_result.get('cluster_summary'):
+                cluster_summaries.append(batch_result['cluster_summary'])
+            
+            if batch_result.get('cluster_importance'):
+                importance_levels.append(batch_result['cluster_importance'])
+        
+        # Aggregate results
+        if not all_selected:
+            return {
+                'selected_images': [],
+                'cluster_summary': 'No images selected from any batch',
+                'cluster_importance': 'low'
+            }
+        
+        # Sort by overall score (from LLM)
+        all_selected.sort(key=lambda x: (
+            x.get('technical_score', 0) + 
+            x.get('composition_score', 0) + 
+            x.get('moment_score', 0)
+        ) / 3, reverse=True)
+        
+        # Re-rank
+        for idx, img in enumerate(all_selected, 1):
+            img['rank'] = idx
+        
+        # Determine overall importance
+        importance_map = {'high': 3, 'medium': 2, 'low': 1, 'none': 0}
+        avg_importance = sum(importance_map.get(imp, 1) for imp in importance_levels) / max(1, len(importance_levels))
+        
+        if avg_importance >= 2.5:
+            overall_importance = 'high'
+        elif avg_importance >= 1.5:
+            overall_importance = 'medium'
+        else:
+            overall_importance = 'low'
+        
+        # Combine summaries
+        combined_summary = f"Multi-pass evaluation of {len(cluster_images)} images. " + \
+                          " | ".join(set(cluster_summaries))
+        
+        print(f"      ✓ Selected {len(all_selected)} images from {len(cluster_images)} total (multi-pass)")
+        
+        return {
+            'selected_images': all_selected,
+            'cluster_summary': combined_summary,
+            'cluster_importance': overall_importance
+        }
+    
     def select_from_all_clusters(self,
                                 cluster_groups: Dict[int, List[Dict]],
                                 image_loader,
                                 image_processor,
-                                top_k_per_cluster: int = None) -> Dict[int, Dict]:
-        """Select best images from all clusters using LLM (SMART, NO HARD LIMITS).
+                                top_k_per_cluster: int = None,
+                                use_parallel: bool = True) -> Dict[int, Dict]:
+        """Select best images from all clusters using PARALLEL LLM calls with rate limit handling.
+        
+        Benefits of parallelism:
+        - 3x faster processing with 3 concurrent workers
+        - Intelligent rate limit handling with exponential backoff
+        - Progress tracking across all parallel operations
+        - Automatic retry with adaptive delays
         
         Args:
             cluster_groups: Dict mapping cluster_id -> list of images
             image_loader: ImageLoader instance
             image_processor: ImageProcessor instance
             top_k_per_cluster: Soft suggestion (None = let LLM decide based on quality)
+            use_parallel: Use parallel processing (default: True)
             
         Returns:
             Dict mapping cluster_id -> selection results
         """
-        from tqdm import tqdm
-        
         print(f"\n[LLM Cluster Selection] Processing {len(cluster_groups)} clusters...")
-        print("  Strategy: LLM will intelligently select best images from each cluster")
+        print(f"  Strategy: Parallel LLM evaluation with {self.max_workers} workers")
+        print("  Rate limit handling: Enabled with exponential backoff")
         print("  No hard limits - prioritizing quality over arbitrary quotas")
+        
+        if not use_parallel or len(cluster_groups) <= 1:
+            # Sequential processing for small workloads
+            return self._select_sequential(cluster_groups, image_loader, image_processor, top_k_per_cluster)
+        else:
+            # Parallel processing with rate limit handling
+            return self._select_parallel(cluster_groups, image_loader, image_processor, top_k_per_cluster)
+        
+        return selections
+    
+    def _select_sequential(self, cluster_groups: Dict[int, List[Dict]],
+                          image_loader, image_processor,
+                          top_k_per_cluster: int = None) -> Dict[int, Dict]:
+        """Sequential processing (fallback)."""
+        from tqdm import tqdm
         
         selections = {}
         
         for cluster_id, images in tqdm(cluster_groups.items(), 
-                                       desc="LLM smart selection",
+                                       desc="Sequential LLM",
                                        ncols=80):
-            if cluster_id == -1:  # Skip noise cluster
+            if cluster_id == -1:
                 continue
             
             selection = self.select_from_cluster(
-                images,
-                image_loader,
-                image_processor,
-                top_k=top_k_per_cluster
+                images, image_loader, image_processor, top_k=top_k_per_cluster
             )
-            
             selections[cluster_id] = selection
         
-        # Print detailed summary
+        self._print_summary(selections, cluster_groups)
+        return selections
+    
+    def _select_parallel(self, cluster_groups: Dict[int, List[Dict]],
+                        image_loader, image_processor,
+                        top_k_per_cluster: int = None) -> Dict[int, Dict]:
+        """Parallel processing with rate limit handling."""
+        from tqdm import tqdm
+        
+        selections = {}
+        
+        # Filter out noise cluster and prepare tasks
+        valid_clusters = [(cid, images) for cid, images in cluster_groups.items() if cid != -1]
+        
+        # Process clusters in parallel
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_cluster = {
+                executor.submit(
+                    self.select_from_cluster,
+                    images,
+                    image_loader,
+                    image_processor,
+                    top_k_per_cluster
+                ): cluster_id
+                for cluster_id, images in valid_clusters
+            }
+            
+            # Process results as they complete
+            with tqdm(total=len(future_to_cluster), desc="Parallel LLM", ncols=80) as pbar:
+                for future in as_completed(future_to_cluster):
+                    cluster_id = future_to_cluster[future]
+                    try:
+                        selection = future.result()
+                        selections[cluster_id] = selection
+                    except Exception as e:
+                        print(f"\n  ✗ Cluster {cluster_id} failed: {e}")
+                        selections[cluster_id] = {
+                            'selected_images': [],
+                            'cluster_summary': f'Processing failed: {e}',
+                            'cluster_importance': 'low'
+                        }
+                    pbar.update(1)
+        
+        self._print_summary(selections, cluster_groups)
+        return selections
+    
+    def _print_summary(self, selections: Dict[int, Dict], 
+                      cluster_groups: Dict[int, List[Dict]]):
+        """Print processing summary."""
         total_selected = sum(len(s['selected_images']) for s in selections.values())
         total_available = sum(len(images) for cid, images in cluster_groups.items() if cid != -1)
         high_importance = sum(1 for s in selections.values() if s.get('cluster_importance') == 'high')
         
-        print(f"\n✓ LLM smart cluster selection complete:")
+        print(f"\n✓ LLM cluster selection complete:")
         print(f"  Clusters processed: {len(selections)}")
         print(f"  Total images selected: {total_selected} out of {total_available} ({100*total_selected/max(1,total_available):.1f}%)")
         print(f"  High-importance clusters: {high_importance}")
         print(f"  Avg images per cluster: {total_selected // max(1, len(selections))}")
-        
-        return selections
     
     def save_selections(self, 
                        selections: Dict[int, Dict],

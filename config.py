@@ -30,10 +30,14 @@ class Config:
     
     # LLM settings
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-    OPENAI_VISION_MODEL = "chatgpt-4o-latest"  # GPT-4o latest (GPT-5 when available)
+    OPENAI_VISION_MODEL = "gpt-4.1"  # GPT-4o latest (GPT-5 when available)
     IMAGES_PER_LLM_CALL = 5
     LLM_TEMPERATURE = 0.1
     LLM_MAX_TOKENS = 1000
+    
+    # LLM parallel processing
+    LLM_MAX_WORKERS = 3  # Concurrent API calls (3 = good balance of speed & rate limits)
+    LLM_RATE_LIMIT_RETRY = True  # Auto-retry on rate limits with exponential backoff
     
     # LLM image resizing (before sending to vision model)
     LLM_IMAGE_MAX_SIZE = 512  # Max dimension for images sent to LLM

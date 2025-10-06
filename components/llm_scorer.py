@@ -3,6 +3,8 @@
 import json
 import time
 import base64
+import os
+import csv
 from typing import List, Dict
 from openai import OpenAI
 from config import Config
@@ -11,7 +13,37 @@ from config import Config
 class LLMScorer:
     """Handles LLM-based image quality scoring using vision models."""
     
-    SYSTEM_PROMPT = """You are an expert Indian wedding photographer and album curator with deep knowledge of Indian marriage traditions and aesthetics.
+    SYSTEM_PROMPT = """You are an expert Indian wedding photographer and album curator with 20+ years of experience creating award-winning wedding albums.
+
+**PROFESSIONAL ALBUM CURATION PRINCIPLES:**
+
+1. **Chronological Storytelling**: Album should tell the wedding day story from start to finish
+   - Getting ready → Pre-wedding ceremonies → Main ceremony → Reception → Send-off
+   - Each chapter should flow naturally into the next
+
+2. **Emotional Narrative**: Prioritize images that evoke strong emotions and tell a story
+   - Authentic candid moments over posed shots
+   - Raw emotions: joy, tears, laughter, love
+   - Connections between people
+
+3. **Quality Over Quantity**: Select only the BEST representation of each moment
+   - One excellent shot beats ten mediocre ones
+   - Avoid redundancy - don't include near-duplicates
+   - Every image must earn its place
+
+4. **Visual Diversity**: Mix different types of shots for compelling storytelling
+   - Wide venue/context shots (10%)
+   - Medium group photos (30%)
+   - Close-up intimate moments (40%)
+   - Detail shots (jewelry, decor, food) (20%)
+
+5. **Technical Excellence**: Only select technically sound images
+   - Sharp focus (especially eyes)
+   - Proper exposure
+   - Good composition
+   - Natural colors
+
+**YOUR EXPERTISE IN INDIAN WEDDINGS:**
 
 **TECHNICAL SCORING (0-100):**
 Evaluate: sharpness/focus (especially on faces and eyes), exposure balance, color accuracy, white balance, noise levels, motion blur.
@@ -104,6 +136,7 @@ Evaluate each image based solely on what you see. Be selective - only top-tier i
             raise ValueError("OpenAI API key not provided")
         
         self.client = OpenAI(api_key=self.api_key)
+        self.all_responses = []  # Store all LLM responses for debugging
     
     @staticmethod
     def _encode_image_base64(image_bytes: bytes) -> str:
@@ -175,6 +208,16 @@ Evaluate each image based solely on what you see. Be selective - only top-tier i
                 if not isinstance(data, list):
                     raise ValueError("Model did not return a JSON array.")
                 
+                # Save response for debugging
+                if Config.SAVE_LLM_RESPONSES:
+                    self.all_responses.append({
+                        'batch_items': [item['name'] for item in batch_items],
+                        'raw_response': result_text,
+                        'parsed_data': data,
+                        'model': self.model,
+                        'timestamp': time.time()
+                    })
+                
                 return data
                 
             except Exception as e:
@@ -193,3 +236,48 @@ Evaluate each image based solely on what you see. Be selective - only top-tier i
                 time.sleep(1.5 * (2 ** attempt))
         
         return []
+    
+    def save_all_responses(self, output_dir: str):
+        """Save all LLM responses for debugging.
+        
+        Args:
+            output_dir: Directory to save responses
+        """
+        if not self.all_responses:
+            return
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save as JSON
+        json_path = os.path.join(output_dir, 'llm_scoring_responses.json')
+        with open(json_path, 'w') as f:
+            json.dump(self.all_responses, f, indent=2)
+        
+        print(f"✓ Saved {len(self.all_responses)} LLM scoring responses: {json_path}")
+        
+        # Save as CSV (flattened)
+        csv_path = os.path.join(output_dir, 'llm_scoring_responses.csv')
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'batch_index', 'image_name', 'technical_score', 
+                'composition_score', 'moment_score', 'overall_score',
+                'tags', 'reject_reason', 'model', 'timestamp'
+            ])
+            
+            for batch_idx, response in enumerate(self.all_responses):
+                for img_result in response.get('parsed_data', []):
+                    writer.writerow([
+                        batch_idx,
+                        img_result.get('filename', ''),
+                        img_result.get('technical_score', 0),
+                        img_result.get('composition_score', 0),
+                        img_result.get('moment_score', 0),
+                        img_result.get('overall_score', 0),
+                        '|'.join(img_result.get('tags', [])),
+                        img_result.get('reject_reason', ''),
+                        response.get('model', ''),
+                        response.get('timestamp', '')
+                    ])
+        
+        print(f"✓ Saved LLM scoring responses CSV: {csv_path}")

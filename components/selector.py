@@ -65,9 +65,13 @@ class Selector:
         
         Args:
             results: List of result dicts
-            filename: Output CSV filename
+            filename: Output CSV filename or full path
         """
-        csv_path = os.path.join(self.output_dir, filename)
+        # Check if filename is a full path
+        if os.path.isabs(filename):
+            csv_path = filename
+        else:
+            csv_path = os.path.join(self.output_dir, filename)
         
         fieldnames = [
             "name", "path", "final_score",

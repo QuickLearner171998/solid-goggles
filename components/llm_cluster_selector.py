@@ -56,6 +56,10 @@ You are reviewing a CLUSTER of similar wedding photos (similar moment/scene/comp
    - ✗ Poor lighting (too dark/bright, washed out)
    - ✗ Distracting backgrounds
    - ✗ Technically flawed (wrong focus, motion blur)
+   - ✗ **CRITICAL**: Individual person photos (single person only) UNLESS it's the bride or groom solo
+     → Skip photos of single guests/family members alone
+     → Keep bride solo portraits ✓
+     → Keep groom solo portraits ✓
 
 2. **Compare Remaining**:
    - Which has SHARPEST focus?

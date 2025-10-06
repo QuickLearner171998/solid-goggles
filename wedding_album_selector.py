@@ -645,13 +645,14 @@ class WeddingAlbumSelector:
     def _select_with_cluster_diversity(self, cluster_images: Dict[int, List[Dict]],
                                       cluster_importance: Dict[int, str],
                                       target_count: int = 1000) -> List[Dict]:
-        """Select images with cluster diversity - MAXIMIZES clustering benefits.
+        """SMART cluster-based selection - skip weak clusters, prioritize quality.
         
         Strategy:
-        1. Allocate slots to clusters based on importance
-        2. Round-robin selection from clusters
-        3. Ensures diverse representation
-        4. Quality threshold maintained
+        1. Evaluate cluster quality from LLM selections and scores
+        2. SKIP clusters with no good images (low quality + low importance)
+        3. Allocate slots dynamically based on cluster importance AND quality
+        4. Global ranking: pick absolute best images across all clusters
+        5. Ensure diversity while maintaining quality threshold
         
         Args:
             cluster_images: Dict of cluster_id -> list of images (sorted by score)
@@ -659,62 +660,157 @@ class WeddingAlbumSelector:
             target_count: Target number of images
             
         Returns:
-            List of selected images with good cluster diversity
+            List of best images with smart cluster awareness
         """
-        # Map importance to base allocation
-        importance_weights = {
-            'high': 15,      # High-importance clusters get more images
-            'medium': 8,     # Medium clusters get moderate allocation
-            'low': 3,        # Low clusters get minimum representation
-            'none': 1
-        }
+        print("\n[Smart Cluster Selection]")
         
-        # Calculate initial allocation per cluster
-        cluster_allocations = {}
+        # STEP 1: Evaluate each cluster's quality
+        cluster_quality = {}
         for cluster_id, images in cluster_images.items():
             if not images:
                 continue
+            
+            # Calculate cluster quality metrics
+            avg_score = sum(img.get('final_score', 0) for img in images) / len(images)
+            max_score = max((img.get('final_score', 0) for img in images), default=0)
+            num_images = len(images)
             importance = cluster_importance.get(cluster_id, 'medium')
-            weight = importance_weights.get(importance, 8)
-            # Allocation = weight, but capped by available images
-            cluster_allocations[cluster_id] = min(weight, len(images))
+            
+            cluster_quality[cluster_id] = {
+                'avg_score': avg_score,
+                'max_score': max_score,
+                'num_images': num_images,
+                'importance': importance,
+                'images': images
+            }
         
-        # Adjust allocations to hit target (may need scaling)
+        # STEP 2: Filter out weak clusters (skip if no good images)
+        QUALITY_THRESHOLD = 60  # Minimum average score
+        SKIP_LOW_IMPORTANCE_THRESHOLD = 70  # Low importance needs higher scores
+        
+        eligible_clusters = {}
+        skipped_clusters = []
+        
+        for cluster_id, quality in cluster_quality.items():
+            importance = quality['importance']
+            avg_score = quality['avg_score']
+            max_score = quality['max_score']
+            
+            # Skip criteria
+            should_skip = False
+            
+            if importance == 'low' and avg_score < SKIP_LOW_IMPORTANCE_THRESHOLD:
+                should_skip = True
+                skip_reason = f"low importance + low avg score ({avg_score:.1f})"
+            elif importance == 'none':
+                should_skip = True
+                skip_reason = "no importance"
+            elif max_score < QUALITY_THRESHOLD:
+                should_skip = True
+                skip_reason = f"no images above quality threshold (max={max_score:.1f})"
+            
+            if should_skip:
+                skipped_clusters.append((cluster_id, skip_reason))
+            else:
+                eligible_clusters[cluster_id] = quality
+        
+        print(f"  Eligible clusters: {len(eligible_clusters)} (skipped {len(skipped_clusters)} weak clusters)")
+        if skipped_clusters[:5]:  # Show first 5 skipped
+            for cid, reason in skipped_clusters[:5]:
+                print(f"    Skipped cluster {cid}: {reason}")
+        
+        # STEP 3: Smart allocation based on importance AND quality
+        importance_base_weights = {
+            'high': 20,      # High importance = critical moments
+            'medium': 10,    # Medium = good moments worth including  
+            'low': 4,        # Low = only if high quality
+        }
+        
+        cluster_allocations = {}
+        for cluster_id, quality in eligible_clusters.items():
+            importance = quality['importance']
+            avg_score = quality['avg_score']
+            num_images = quality['num_images']
+            
+            # Base weight from importance
+            base_weight = importance_base_weights.get(importance, 10)
+            
+            # Quality multiplier (0.6 to 1.4 range)
+            quality_multiplier = 0.6 + (avg_score / 100) * 0.8
+            
+            # Size factor - larger clusters get more (but capped)
+            size_factor = min(1.0 + (num_images / 50) * 0.3, 1.5)
+            
+            # Final allocation
+            allocation = int(base_weight * quality_multiplier * size_factor)
+            allocation = max(2, min(allocation, num_images))  # At least 2, max available
+            
+            cluster_allocations[cluster_id] = allocation
+        
+        # STEP 4: Normalize allocations to target count
         total_allocated = sum(cluster_allocations.values())
         
         if total_allocated > target_count:
-            # Scale down proportionally
             scale_factor = target_count / total_allocated
             for cluster_id in cluster_allocations:
                 cluster_allocations[cluster_id] = max(1, int(cluster_allocations[cluster_id] * scale_factor))
         
-        # First pass: Select allocated images from each cluster
-        selected = []
+        print(f"  Allocation strategy:")
+        print(f"    Target images: {target_count}")
+        print(f"    Total allocated: {sum(cluster_allocations.values())}")
+        
+        # Show allocation breakdown
+        by_importance = {'high': 0, 'medium': 0, 'low': 0}
         for cluster_id, allocation in cluster_allocations.items():
-            images = cluster_images[cluster_id][:allocation]  # Top N from cluster
+            importance = eligible_clusters[cluster_id]['importance']
+            by_importance[importance] += allocation
+        print(f"    High-importance: {by_importance['high']} images")
+        print(f"    Medium-importance: {by_importance['medium']} images")
+        print(f"    Low-importance: {by_importance['low']} images")
+        
+        # STEP 5: Select top images from each eligible cluster
+        selected = []
+        for cluster_id, allocation in sorted(cluster_allocations.items(), 
+                                            key=lambda x: eligible_clusters[x[0]]['avg_score'], 
+                                            reverse=True):
+            images = eligible_clusters[cluster_id]['images'][:allocation]
             selected.extend(images)
         
-        # Second pass: Fill remaining slots with best remaining images
-        if len(selected) < target_count:
-            remaining_needed = target_count - len(selected)
-            
-            # Get all non-selected images
-            selected_paths = {img['path'] for img in selected}
-            remaining = []
-            for images_list in cluster_images.values():
-                for img in images_list:
-                    if img['path'] not in selected_paths:
-                        remaining.append(img)
-            
-            # Sort by score and take top N
-            remaining.sort(key=lambda x: x.get('final_score', 0), reverse=True)
-            selected.extend(remaining[:remaining_needed])
-        
-        # Final sort by score for ranking
+        # STEP 6: Global ranking pass - ensure we have the ABSOLUTE BEST images
+        # Sort all selected by score and take top N
         selected.sort(key=lambda x: x.get('final_score', 0), reverse=True)
         
-        # Add rank
-        for idx, img in enumerate(selected, 1):
-            img['final_rank'] = idx
+        # If we have more than target, trim to exactly target
+        if len(selected) > target_count:
+            selected = selected[:target_count]
+            print(f"  Trimmed to top {target_count} images (highest scores across all clusters)")
         
-        return selected[:target_count]
+        # STEP 7: Fill remaining slots if needed (from unused high-quality images)
+        elif len(selected) < target_count:
+            remaining_needed = target_count - len(selected)
+            print(f"  Need {remaining_needed} more images to reach target")
+            
+            # Collect all images not yet selected (only from eligible clusters)
+            selected_paths = set(img['path'] for img in selected)
+            remaining_images = []
+            
+            for cluster_id, quality in eligible_clusters.items():
+                for img in quality['images']:
+                    if img['path'] not in selected_paths and img.get('final_score', 0) >= QUALITY_THRESHOLD:
+                        remaining_images.append(img)
+            
+            # Sort by score and add best remaining
+            remaining_images.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+            additional = remaining_images[:remaining_needed]
+            selected.extend(additional)
+            
+            print(f"  Added {len(additional)} additional high-quality images from unused pool")
+        
+        # Final global ranking by score
+        selected.sort(key=lambda x: x.get('final_score', 0), reverse=True)
+        
+        print(f"\n✓ Final selection: {len(selected)} images")
+        print(f"  Score range: {selected[-1].get('final_score', 0):.1f} - {selected[0].get('final_score', 0):.1f}")
+        print(f"  Represented clusters: {len(set(img.get('cluster_id', -1) for img in selected))}")
+        
+        return selected
